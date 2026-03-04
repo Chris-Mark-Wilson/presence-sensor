@@ -34,7 +34,7 @@ static const char *TAG = "MMW_ZB";
 #define HA_ENDPOINT          1
 
 // Publish cadence
-#define PUBLISH_PERIOD_MS    5000
+#define PUBLISH_PERIOD_MS    1000
 
 // Manufacturer/model shown in ZHA device info
 #define MANUFACTURER_NAME    "ChrisLabs"
@@ -65,7 +65,11 @@ static const char *TAG = "MMW_ZB";
 // Latest parsed distance in cm (0..400 for 4m)
 static float g_range_cm = -1.0f;
 static bool  g_have_range = false;
-static bool  g_zb_joined = false;
+
+static volatile bool g_zb_joined = false;
+static volatile bool g_zb_steering_in_progress = false;
+static volatile bool g_bdb_in_progress = false;
+static TimerHandle_t s_rejoin_timer = NULL;
 
 // ---------- UART (HMMD) ----------
 static void hmmd_uart_init(void)
@@ -86,6 +90,16 @@ static void hmmd_uart_init(void)
 
     ESP_LOGI(TAG, "HMMD UART init OK (TX=%d RX=%d @%d)",
              HMMD_UART_TX_GPIO, HMMD_UART_RX_GPIO, HMMD_UART_BAUD);
+}
+static void rejoin_timer_cb(TimerHandle_t t)
+{
+    (void)t;
+
+    if (!esp_zb_bdb_dev_joined() && !g_bdb_in_progress) {
+        ESP_LOGW(TAG, "Not joined after timeout -> starting network steering");
+        g_bdb_in_progress = true;
+        esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+    }
 }
 
 static void hmmd_read_task(void *arg)
@@ -120,35 +134,72 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     esp_zb_app_signal_type_t sig = (esp_zb_app_signal_type_t)*p;
     esp_err_t status = signal_struct->esp_err_status;
 
+    ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s",
+             esp_zb_zdo_signal_to_string(sig), sig, esp_err_to_name(status));
+
     switch (sig) {
-        case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
-            ESP_LOGI(TAG, "Zigbee stack ready, starting network steering...");
+
+    case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START: {
+        ESP_LOGI(TAG, "First start -> network steering");
+        g_zb_joined = false;
+        g_bdb_in_progress = true;
+        esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+        break;
+    }
+    case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP: {
+    bool factory_new = esp_zb_bdb_is_factory_new();
+    ESP_LOGI(TAG, "Skip startup -> start commissioning. factory_new=%d", factory_new);
+
+    g_zb_joined = false;
+    g_bdb_in_progress = true;
+
+    // For a sensor joining ZHA, steering is what you want:
+    esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+    break;
+}
+
+    case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT: {
+        bool factory_new = esp_zb_bdb_is_factory_new();
+        ESP_LOGI(TAG, "Reboot. factory_new=%d", factory_new);
+
+        g_zb_joined = false;
+        g_bdb_in_progress = false;
+
+        // If not factory-new: DON'T steer immediately.
+        // Let the stack rejoin silently using stored network params.
+        // Start a fallback timer in case it doesn't.
+        if (s_rejoin_timer) xTimerStart(s_rejoin_timer, 0);
+
+        if (factory_new) {
+            ESP_LOGI(TAG, "Factory new -> network steering");
+            g_bdb_in_progress = true;
             esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
-            break;
+        }
+        break;
+    }
 
-        case ESP_ZB_BDB_SIGNAL_STEERING:
-            if (status == ESP_OK) {
-                g_zb_joined = true;
-                ESP_LOGI(TAG, "Joined Zigbee network OK");
-            } else {
-                g_zb_joined = false;
-                ESP_LOGW(TAG, "Join failed (%d), retrying...", status);
-                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
-            }
-            break;
+    case ESP_ZB_BDB_SIGNAL_STEERING:
+        g_bdb_in_progress = false;
+        if (status == ESP_OK) {
+            g_zb_joined = true;
+            ESP_LOGI(TAG, "Joined OK (STEERING)");
+            if (s_rejoin_timer) xTimerStop(s_rejoin_timer, 0);
+        } else {
+            ESP_LOGW(TAG, "Steering failed (%s)", esp_err_to_name(status));
+            // Let the fallback timer kick another attempt, or restart it here:
+            if (s_rejoin_timer) xTimerStart(s_rejoin_timer, 0);
+        }
+        break;
 
-        case ESP_ZB_ZDO_SIGNAL_PRODUCTION_CONFIG_READY:
-            if (status == ESP_OK) {
-                ESP_LOGI(TAG, "Production config loaded");
-            } else {
-                ESP_LOGW(TAG, "No production config found (expected if zb_fct is empty)");
-            }
-            break;
+    case ESP_ZB_ZDO_SIGNAL_LEAVE_INDICATION:
+        ESP_LOGW(TAG, "Leave indication");
+        g_zb_joined = false;
+        g_bdb_in_progress = false;
+        if (s_rejoin_timer) xTimerStart(s_rejoin_timer, 0);
+        break;
 
-        default:
-            ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s",
-                     esp_zb_zdo_signal_to_string(sig), sig, esp_err_to_name(status));
-            break;
+    default:
+        break;
     }
 }
 
@@ -233,10 +284,16 @@ ESP_LOGI(TAG,"measured %d",measured);
 static void publish_task(void *arg)
 {
     (void)arg;
+
     while (1) {
-        if (g_zb_joined) {
+        // Ask Zigbee stack whether we are joined *right now*
+        bool joined = esp_zb_bdb_dev_joined();  // reliable join state :contentReference[oaicite:1]{index=1}
+        g_zb_joined = joined;
+
+        if (joined && g_have_range) {
             publish_range();
         }
+
         vTaskDelay(pdMS_TO_TICKS(PUBLISH_PERIOD_MS));
     }
 }
@@ -272,8 +329,8 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
 
     hmmd_uart_init();
+    s_rejoin_timer = xTimerCreate("rejoin", pdMS_TO_TICKS(15000), pdFALSE, NULL, rejoin_timer_cb);
     xTaskCreate(hmmd_read_task, "hmmd_read", 4096, NULL, 6, NULL);
-
     xTaskCreate(zigbee_task, "zigbee", 8192, NULL, 5, NULL);
     xTaskCreate(publish_task, "publish", 2048, NULL, 4, NULL);
 
